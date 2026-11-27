@@ -1,0 +1,96 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [develop, staging, main]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Título no formato: tipo: EDGE-1234 descrição
+  # PRs de promoção (develop -> staging -> main) usam merge commit, não passam por aqui.
+  pr-title:
+    if: ${{ github.head_ref != 'develop' && github.head_ref != 'staging' }}
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          subjectPattern: ^EDGE-\d+ .+$
+          subjectPatternError: |
+            O título deve ser: tipo: EDGE-1234 descrição
+            Exemplo: feat: EDGE-1234 adicionar tela de histórico
+
+  # Detecta quais serviços foram alterados
+  changes:
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - 'docker-compose.yaml'
+              - '.github/workflows/**'
+            frontend:
+              - 'frontend/**'
+              - 'docker-compose.yaml'
+              - '.github/workflows/**'
+
+  ci-backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    uses: ./.github/workflows/backend-ci.yaml
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+
+  ci-frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    uses: ./.github/workflows/frontend-ci.yaml
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+
+  # Este é o ÚNICO check a marcar como obrigatório na proteção das branches.
+  # Aceita "pulado" como sucesso e falha se qualquer job acima falhou.
+  checks-ok:
+    needs: [pr-title, changes, ci-backend, ci-frontend]
+    if: always()
+    runs-on: self-hosted
+    timeout-minutes: 2
+    steps:
+      - name: Verificar resultado dos checks
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Resultados: $RESULTS"
+          case "$RESULTS" in
+            *failure*|*cancelled*) echo "Algum check falhou"; exit 1 ;;
+          esac

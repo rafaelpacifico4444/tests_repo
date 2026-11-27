@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    branches: [develop, staging, main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versão já publicada para reimplantar na staging (ex.: 0.3.0-rc.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. CI dos dois serviços (develop e staging).
+  #    Na main não roda: o código já foi validado na staging.
+  # ---------------------------------------------------------------
+  ci-backend:
+    if: github.event_name == 'push' && github.ref_name != 'main'
+    uses: ./.github/workflows/backend-ci.yaml
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+
+  ci-frontend:
+    if: github.event_name == 'push' && github.ref_name != 'main'
+    uses: ./.github/workflows/frontend-ci.yaml
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+
+  # ---------------------------------------------------------------
+  # 2. Versão única do repositório (semantic-release).
+  #    Só roda se o CI passou (ou foi pulado, na main).
+  #    Develop -> vX.Y.Z-alpha.N | Staging -> vX.Y.Z-rc.N | Main -> vX.Y.Z
+  # ---------------------------------------------------------------
+  release:
+    needs: [ci-backend, ci-frontend]
+    if: ${{ !cancelled() && !failure() && github.event_name == 'push' }}
+    runs-on: self-hosted
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      published: ${{ steps.sr.outputs.new_release_published }}
+      version: ${{ steps.sr.outputs.new_release_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - id: sr
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          semantic_version: 24
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------
+  # 3. Build das imagens (somente staging), os dois serviços.
+  #    A imagem nasce com a versão: ghcr.io/.../backend:0.3.0-rc.2
+  # ---------------------------------------------------------------
+  build:
+    needs: release
+    if: github.ref_name == 'staging' && needs.release.outputs.published == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: backend
+            build-args: ""
+          - service: frontend
+            build-args: API_URL=/api
+    uses: ./.github/workflows/docker-build.yaml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      service: ${{ matrix.service }}
+      version: ${{ needs.release.outputs.version }}
+      build-args: ${{ matrix.build-args }}
+
+  # ---------------------------------------------------------------
+  # 4. Deploy na EC2 (somente staging).
+  #    Só começa depois que os DOIS builds terminaram com sucesso.
+  # ---------------------------------------------------------------
+  deploy:
+    needs: [release, build]
+    if: github.ref_name == 'staging' && needs.release.outputs.published == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, frontend]
+    uses: ./.github/workflows/ec2-deploy.yaml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      service: ${{ matrix.service }}
+      app-dir: /home/ubuntu/oxematch
+      image-tag: ${{ needs.release.outputs.version }}
+    secrets:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_SSH_USER: ${{ vars.EC2_SSH_USER }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+  # ---------------------------------------------------------------
+  # 5. Disparo manual: reimplanta uma versão que já existe no GHCR
+  #    (usado para rollback ou para repetir um deploy).
+  # ---------------------------------------------------------------
+  redeploy:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, frontend]
+    uses: ./.github/workflows/ec2-deploy.yaml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      service: ${{ matrix.service }}
+      app-dir: /home/ubuntu/oxematch
+      image-tag: ${{ inputs.version }}
+    secrets:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_SSH_USER: ${{ vars.EC2_SSH_USER }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+  # ---------------------------------------------------------------
+  # 6. Sync-back (somente main): leva a tag estável de volta para
+  #    staging e develop, para a numeração seguir correta.
+  # ---------------------------------------------------------------
+  sync-back:
+    needs: release
+    if: github.ref_name == 'main' && needs.release.outputs.published == 'true'
+    runs-on: self-hosted
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Mesclar main em staging e develop
+        run: |
+          set -euo pipefail
+          git config user.name  "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          for b in staging develop; do
+            git checkout "$b"
+            git merge origin/main --no-edit -m "chore: sync main into $b [skip ci]"
+            git push origin "$b"
+          done

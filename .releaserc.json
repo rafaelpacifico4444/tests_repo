@@ -1,0 +1,18 @@
+{
+  "branches": [
+    "main",
+    { "name": "staging", "prerelease": "rc" },
+    { "name": "develop", "prerelease": "alpha" }
+  ],
+  "tagFormat": "v${version}",
+  "plugins": [
+    [
+      "@semantic-release/commit-analyzer",
+      {
+        "releaseRules": [{ "breaking": true, "release": "minor" }]
+      }
+    ],
+    "@semantic-release/release-notes-generator",
+    "@semantic-release/github"
+  ]
+}

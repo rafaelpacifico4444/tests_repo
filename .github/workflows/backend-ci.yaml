@@ -1,0 +1,94 @@
+name: Backend CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: self-hosted
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: app_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d app_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/app_test
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.postgresql.Driver
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: 10
+      SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          
+# FORMAT
+
+      - uses: super-linter/super-linter/slim@v9.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: main
+          FILTER_REGEX_INCLUDE: backend/.*
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_YAML: true
+          VALIDATE_DOCKERFILE_HADOLINT: true
+          CREATE_LOG_FILE: false
+          
+# TEST
+
+      - uses: actions/setup-java@v5 
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+      - run: ./mvnw -B test
+      
+# ANALYSIS
+
+      # - name: SpotBugs + Find Security Bugs
+      #   run: ./mvnw -B spotbugs:check
+
+      # - name: Upload SpotBugs report
+      #   if: failure()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: backend-spotbugs-report
+      #     path: backend/target/spotbugsXml.xml
+      #     if-no-files-found: ignore
+
+      # - name: Trivy (dependencies and secrets)
+      #   uses: aquasecurity/trivy-action@v0.36.0
+      #   with:
+      #     scan-type: fs
+      #     scan-ref: backend
+      #     scanners: vuln,secret
+      #     severity: CRITICAL,HIGH
+      #     ignore-unfixed: true
+      #     exit-code: "1"
+          
+# BUILD          
+       
+      - run: ./mvnw -B package -DskipTests

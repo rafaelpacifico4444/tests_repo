@@ -1,0 +1,169 @@
+name: Deploy to EC2
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+
+      app-dir:
+        required: true
+        type: string
+
+      image-tag:
+        description: "Tag da imagem = versão semântica sem o 'v' (ex.: 0.3.0-rc.2)"
+        required: true
+        type: string
+
+    secrets:
+      EC2_HOST:
+        required: true
+
+      EC2_SSH_USER:
+        required: true
+
+      EC2_SSH_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          SERVICE: ${{ inputs.service }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          set -euo pipefail
+
+          case "$SERVICE" in
+            frontend|backend)
+              ;;
+            *)
+              echo "Serviço inválido: $SERVICE"
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "$IMAGE_TAG" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "Tag inválida: $IMAGE_TAG"
+            exit 1
+          fi
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/ec2.pem"
+          chmod 600 "$HOME/.ssh/ec2.pem"
+          ssh-keyscan -H "$EC2_HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Copy compose and pgadmin config
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_SSH_USER }}
+          APP_DIR: ${{ inputs.app-dir }}
+        run: |
+          set -euo pipefail
+
+          ssh -i "$HOME/.ssh/ec2.pem" \
+            "$SSH_USER@$EC2_HOST" \
+            "mkdir -p '$APP_DIR/backend/pgadmin'"
+
+          scp -i "$HOME/.ssh/ec2.pem" \
+            docker-compose.yaml \
+            "$SSH_USER@$EC2_HOST:$APP_DIR/docker-compose.yaml"
+
+          scp -i "$HOME/.ssh/ec2.pem" \
+            backend/pgadmin/servers.json \
+            "$SSH_USER@$EC2_HOST:$APP_DIR/backend/pgadmin/servers.json"
+
+      - name: Login to GHCR on EC2
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_SSH_USER }}
+        run: |
+          set -euo pipefail
+
+          printf '%s' "$GHCR_TOKEN" | ssh -i "$HOME/.ssh/ec2.pem" \
+            "$SSH_USER@$EC2_HOST" \
+            "docker login ghcr.io -u '$ACTOR' --password-stdin"
+
+      # Todo o bloco abaixo roda dentro do flock: a edição do .env e o
+      # restart ficam serializados entre backend e frontend.
+      - name: Pull image, restart service and rollback on failure
+        env:
+          SERVICE: ${{ inputs.service }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_SSH_USER }}
+          APP_DIR: ${{ inputs.app-dir }}
+        run: |
+          set -euo pipefail
+
+          ssh -i "$HOME/.ssh/ec2.pem" "$SSH_USER@$EC2_HOST" \
+            flock -w 300 /tmp/oxematch-deploy.lock \
+            bash -s -- "$APP_DIR" "$SERVICE" "$IMAGE_TAG" <<'EOF'
+          set -euo pipefail
+          APP_DIR=$1; SERVICE=$2; TAG=$3
+          VAR="$(echo "$SERVICE" | tr a-z A-Z)_TAG"
+
+          cd "$APP_DIR"
+          touch .env
+
+          # versão atualmente em execução (para rollback)
+          PREV="$(grep "^$VAR=" .env | cut -d= -f2- || true)"
+
+          set_tag() {
+            if grep -q "^$VAR=" .env; then
+              sed -i "s|^$VAR=.*|$VAR=$1|" .env
+            else
+              echo "$VAR=$1" >> .env
+            fi
+          }
+
+          set_tag "$TAG"
+
+          if ! docker compose pull "$SERVICE" \
+             || ! docker compose up -d --no-deps --wait --wait-timeout 120 "$SERVICE"; then
+            echo "Falha ao implantar $SERVICE:$TAG"
+            docker compose logs --tail 50 "$SERVICE" || true
+            if [ -n "$PREV" ]; then
+              echo "Rollback para $SERVICE:$PREV"
+              set_tag "$PREV"
+              docker compose up -d --no-deps "$SERVICE" || true
+            fi
+            exit 1
+          fi
+
+          echo "$SERVICE em execução com a versão $TAG (anterior: ${PREV:-nenhuma})"
+          docker compose ps "$SERVICE"
+          docker image prune -f
+          EOF
+
+      - name: Logout from GHCR on EC2
+        if: always()
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_SSH_USER }}
+        run: |
+          ssh -i "$HOME/.ssh/ec2.pem" "$SSH_USER@$EC2_HOST" \
+            "docker logout ghcr.io" || true
