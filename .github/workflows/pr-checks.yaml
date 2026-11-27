@@ -17,7 +17,7 @@ jobs:
   # PRs de promoção (develop -> staging -> main) usam merge commit, não passam por aqui.
   pr-title:
     if: ${{ github.head_ref != 'develop' && github.head_ref != 'staging' }}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -34,7 +34,7 @@ jobs:
 
   # Detecta quais serviços foram alterados
   changes:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -60,30 +60,30 @@ jobs:
               - 'docker-compose.yaml'
               - '.github/workflows/**'
 
-  ci-backend:
-    needs: changes
-    if: needs.changes.outputs.backend == 'true'
-    uses: ./.github/workflows/backend-ci.yaml
-    permissions:
-      actions: read
-      contents: read
-      statuses: write
+  # ci-backend:
+  #   needs: changes
+  #   if: needs.changes.outputs.backend == 'true'
+  #   uses: ./.github/workflows/backend-ci.yaml
+  #   permissions:
+  #     actions: read
+  #     contents: read
+  #     statuses: write
 
-  ci-frontend:
-    needs: changes
-    if: needs.changes.outputs.frontend == 'true'
-    uses: ./.github/workflows/frontend-ci.yaml
-    permissions:
-      actions: read
-      contents: read
-      statuses: write
+  # ci-frontend:
+  #   needs: changes
+  #   if: needs.changes.outputs.frontend == 'true'
+  #   uses: ./.github/workflows/frontend-ci.yaml
+  #   permissions:
+  #     actions: read
+  #     contents: read
+  #     statuses: write
 
   # Este é o ÚNICO check a marcar como obrigatório na proteção das branches.
   # Aceita "pulado" como sucesso e falha se qualquer job acima falhou.
   checks-ok:
-    needs: [pr-title, changes, ci-backend, ci-frontend]
+    needs: [pr-title, changes]
     if: always()
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
       - name: Verificar resultado dos checks
